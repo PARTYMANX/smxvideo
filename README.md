@@ -12,9 +12,11 @@ The program is intended to be built using CMake and Visual Studio on Windows.
 first, install ffmpeg:x86-windows and sdl2:x86-windows using vcpkg.  Then create a build subdirectory and run cmake to generate the project.
 
 for example:
+```
 mkdir build
 cd build
 cmake -A Win32 .. -DCMAKE_TOOLCHAIN_FILE=C:/util/vcpkg/scripts/buildsystems/vcpkg.cmake
+```
 
 I was too lazy to set the SMX SDK up as a proper library, so try running the build once.  It will fail due to SMX.dll and SMX.lib being missing in the output directory.  copy those files from thirdparty/stepmaniax-sdk/ to build/[profile] and run the build again.  It should succeed now.
 
