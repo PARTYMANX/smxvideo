@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+#include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
@@ -13,7 +14,10 @@
 
 //#define NOSCALE
 #define FILLGAPS
-#define PRECACHE_LEN 30	// queue 30 frames in advance
+#define PRECACHE_LEN 0	// queue 30 frames in advance
+
+int bothpads = 0;
+int padoutput = 0;
 
 int smxPanelPosX[18] = {
 	0, 1, 2,
@@ -173,19 +177,44 @@ void videoThread(void *data) {
 #else
 
 #ifdef FILLGAPS
-	int dimension = 56;
+	int dimensionx = 56;
+	int dimensiony = 56;
 #else 
-	int dimension = 30;
+	int dimensionx = 30;
+	int dimensiony = 30;
 #endif
-	if (decoderData->codecContext->width > decoderData->codecContext->height) {
-		outW = (double)((double)dimension / (double)decoderData->codecContext->height) * decoderData->codecContext->width;
-		outH = dimension;
-	} else if (decoderData->codecContext->height > decoderData->codecContext->width) {
-		outH = (double)((double)dimension / (double)decoderData->codecContext->width) * decoderData->codecContext->height;
-		outW = dimension;
+
+	if (bothpads) {
+		printf("OUTPUTTING TO BOTH PADS\n");
+		#ifdef FILLGAPS
+			dimensionx = 125;
+		#else 
+			dimensionx = 60;
+		#endif
+	}
+
+	float padAspectRatio, vidAspectRatio;
+
+	if (padoutput) {
+		printf("PADDING VIDEO OUTPUT\n");
+		padAspectRatio = (double)dimensionx / (double)dimensiony;
+		vidAspectRatio = (double)decoderData->codecContext->width / (double)decoderData->codecContext->height;
 	} else {
-		outW = dimension;
-		outH = dimension;
+		vidAspectRatio = (double)dimensionx / (double)dimensiony;
+		padAspectRatio = (double)decoderData->codecContext->width / (double)decoderData->codecContext->height;
+	}
+	
+	if (padAspectRatio > vidAspectRatio) {
+		// pads wider than video
+		outW = (double)((double)dimensiony / (double)decoderData->codecContext->height) * decoderData->codecContext->width;
+		outH = dimensiony;
+	} else if (padAspectRatio < vidAspectRatio) {
+		// pads narrower than video
+		outH = (double)((double)dimensionx / (double)decoderData->codecContext->width) * decoderData->codecContext->height;
+		outW = dimensionx;
+	} else {
+		outW = dimensionx;
+		outH = dimensiony;
 	}
 	#endif
 
@@ -256,13 +285,14 @@ void videoThread(void *data) {
 
 	startSMX();
 
-	uint8_t *smxBuffer = malloc(1350);
+	uint8_t *smxBuffer = calloc(1350, 1);
 
 	// signal ready and wait for playback to start
 	SDL_SemPost(decoderData->readySemaphore);
 	SDL_SemWait(decoderData->playbackSemaphore);
 
 	uint64_t startTime = SDL_GetPerformanceCounter();
+	uint64_t currentTime = startTime;
 
 	SDL_Event e;
 
@@ -270,11 +300,13 @@ void videoThread(void *data) {
 		while(SDL_PollEvent(&e) != 0) {
 			switch(e.type) {
 			case SDL_QUIT: 
+				exit(0);
 				return 0;	// TODO: cancel and await threads
 			}
 		}
 
 		if (frameQueue_populated(decoderData->queue)) {
+
 			AVPacket *packet = frameQueue_dequeue(decoderData->queue);
 
 			avcodec_send_packet(decoderData->codecContext, packet);
@@ -297,28 +329,51 @@ void videoThread(void *data) {
 				outFrame->linesize
 			);
 
-			uint64_t nextTime = startTime + (((double)(inFrame->pts - decoderData->formatContext->start_time) * timebase * timerFreq));
+			//uint64_t nextTime = startTime + (((double)(inFrame->pts - decoderData->formatContext->start_time) * timebase * timerFreq)); 
+			uint64_t nextTime = currentTime + (((double)inFrame->duration * timebase * timerFreq));
 
-			int offsetX = (outW - dimension) / 2;
-			int offsetY = (outH - dimension) / 2;
+			if (inFrame->duration <= 0) {
+				//printf("BAD DURATION! %lld\n", inFrame->duration);
+				nextTime = startTime + (((double)(inFrame->pts - decoderData->formatContext->start_time) * timebase * timerFreq)); 
+			}
+
+			int offsetX = (outW - dimensionx) / 2;
+			int offsetY = (outH - dimensiony) / 2;
 
 			for (int side = 0; side < 2; side++) {
 				for (int panel = 0; panel < 9; panel++) {
 					for (int light = 0; light < 25; light++) {
-						int posX = offsetX + (smxPanelPosX[panel] * 23) + (smxLedPosX[light]);
-						int posY = offsetY + (smxPanelPosY[panel] * 23) + (smxLedPosY[light]);
+						int posX, posY;
 
-						for (int color = 0; color < 3; color++) {
-							int idx = (side * 675) + (panel * 75) + (light * 3) + color; 
-							int bufIdx = (outFrame->linesize[0] * posY) + (posX * 3) + color;
+						if (bothpads) {
+							posX = offsetX + (smxPanelPosX[(side * 9) + panel] * 23) + (smxLedPosX[light]);
+							posY = offsetY + (smxPanelPosY[(side * 9) + panel] * 23) + (smxLedPosY[light]);
+						} else {
+							posX = offsetX + (smxPanelPosX[panel] * 23) + (smxLedPosX[light]);
+							posY = offsetY + (smxPanelPosY[panel] * 23) + (smxLedPosY[light]);
+						}
+
+						if (posX >= 0 && posX < outW && posY >= 0 && posY < outH) { 
+							for (int color = 0; color < 3; color++) {
+								int idx = (side * 675) + (panel * 75) + (light * 3) + color; 
+								int bufIdx = (outFrame->linesize[0] * posY) + (posX * 3) + color;
 							
-							smxBuffer[idx] = outFrame->data[0][bufIdx];
+								//smxBuffer[idx] = outFrame->data[0][bufIdx];
+
+								smxBuffer[idx] = (float)(outFrame->data[0][bufIdx] * outFrame->data[0][bufIdx])/255.0;
+
+								//outFrame->data[0][bufIdx] = smxBuffer[idx];
+							}
 						}
 					}
 				}
 			}
 
+			//uint64_t currentTime = SDL_GetPerformanceCounter();
+			//printf("NextTime = %llu, %llu\n", nextTime, nextTime - currentTime);
+
 			safeWait(nextTime);
+			currentTime = nextTime;
 
 			setSMXLights(smxBuffer, 1350);
 
@@ -330,10 +385,14 @@ void videoThread(void *data) {
 		}
 	}
 
+	printf("DONE PLAYBACK\n");
+
 	stopSMX();
 
 	SDL_FreeSurface(surf);
 	SDL_DestroyWindow(window);
+
+	exit(0);
 }
 
 void audioThread(void *data) {
@@ -344,7 +403,7 @@ void audioThread(void *data) {
 
 	desiredSpec.freq = decoderData->codecContext->sample_rate;
 	desiredSpec.format = AUDIO_F32;
-	desiredSpec.channels = decoderData->codecContext->channels;
+	desiredSpec.channels = decoderData->codecContext->ch_layout.nb_channels;
 	desiredSpec.silence = 0;
 	desiredSpec.samples = 1024;
 	desiredSpec.callback = NULL;
@@ -355,12 +414,12 @@ void audioThread(void *data) {
 	audioDeviceID = SDL_OpenAudioDevice(NULL, 0, &desiredSpec, &spec, 0);
 
 	struct SwrContext* swrContext = NULL;
-	swrContext = swr_alloc_set_opts(
-		NULL, 
-		AV_CH_LAYOUT_STEREO, 
+	swr_alloc_set_opts2(
+		&swrContext, 
+		&(AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO, 
 		AV_SAMPLE_FMT_FLT, 
 		spec.freq, 
-		decoderData->codecContext->channel_layout, 
+		&decoderData->codecContext->ch_layout, 
 		decoderData->codecContext->sample_fmt, 
 		decoderData->codecContext->sample_rate, 
 		0, 
@@ -371,7 +430,7 @@ void audioThread(void *data) {
 
 	int bufferSize = av_samples_get_buffer_size(
 		NULL, 
-		decoderData->codecContext->channels, 
+		decoderData->codecContext->ch_layout.nb_channels, 
 		spec.samples, 
 		AV_SAMPLE_FMT_FLT, 
 		1
@@ -387,7 +446,7 @@ void audioThread(void *data) {
 		outFrame->data,
 		outFrame->linesize,
 		buffer,
-		decoderData->codecContext->channels,
+		decoderData->codecContext->ch_layout.nb_channels,
 		spec.samples,
 		AV_SAMPLE_FMT_FLT,
 		1
@@ -424,7 +483,7 @@ void audioThread(void *data) {
 
 			swr_convert(swrContext, outFrame->data, inFrame->nb_samples, inFrame->data, inFrame->nb_samples);
 
-			uint32_t sz = av_samples_get_buffer_size(NULL, inFrame->channels, inFrame->nb_samples, AV_SAMPLE_FMT_FLT, 1);
+			uint32_t sz = av_samples_get_buffer_size(NULL, inFrame->ch_layout.nb_channels, inFrame->nb_samples, AV_SAMPLE_FMT_FLT, 1);
 			SDL_QueueAudio(audioDeviceID, outFrame->data[0], sz);
 		}
 	}
@@ -454,16 +513,29 @@ AVCodecContext *getCodecContext(AVCodecParameters *param) {
 int main(int argc, char** argv) {
 	SDL_Init(SDL_INIT_EVERYTHING);
 
+	for (int i = 1; i < argc - 1; i++) {
+		if (strcmp(argv[i], "-w") == 0) {
+			bothpads = 1;
+		}
+
+		if (strcmp(argv[i], "-p") == 0) {
+			padoutput = 1;
+		}
+	}
+
 	// open file
 
 	AVOutputFormat* fmt;
 
+	AVDictionary *d = NULL;
+	av_dict_set(&d, "protocol_whitelist", "file,crypto,data,http,https,tcp,tls", 0);
+
 	AVFormatContext *formatContext = NULL;
-	avformat_open_input(&formatContext, argv[1], NULL, NULL);
+	avformat_open_input(&formatContext, argv[argc - 1], NULL, &d);
 
 	avformat_find_stream_info(formatContext, NULL);
 
-	av_dump_format(formatContext, 0, argv[1], 0);
+	av_dump_format(formatContext, 0, argv[argc - 1], 0);
 
 	int videoStream = -1;
 	int audioStream = -1;
@@ -519,13 +591,13 @@ int main(int argc, char** argv) {
 
 	// wait for threads to become ready
 
-	/*
+	
 	SDL_Thread *videoDecoderThread = SDL_CreateThread(videoThread, "video", videoThreadData);
 	SDL_Thread *audioDecoderThread = SDL_CreateThread(audioThread, "audio", audioThreadData);
 
 	SDL_SemWait(videoThreadData->readySemaphore);
 	SDL_SemWait(audioThreadData->readySemaphore);
-	*/
+	
 
 	uint8_t hasStarted = 0;
 
@@ -545,15 +617,16 @@ int main(int argc, char** argv) {
 
 		// TODO: keep ahead of frames via timestamp, not queued frames since audio immediately consumes the queue
 
-		/*if (!hasStarted && (videoQueue->len >= PRECACHE_LEN && audioQueue >= PRECACHE_LEN)) {
+		if (!hasStarted && (videoQueue->len >= PRECACHE_LEN && audioQueue >= PRECACHE_LEN)) {
+			printf("STARTING VIDEO\n");
 			hasStarted = 1;
 			SDL_SemPost(videoThreadData->playbackSemaphore);
 			SDL_SemPost(audioThreadData->playbackSemaphore);
-		}*/
+		}
 
-		//while (videoQueue->len >= PRECACHE_LEN && audioQueue >= PRECACHE_LEN) {
-		// SDL_Delay(1);
-		//
+		/*while (videoQueue->len >= PRECACHE_LEN && audioQueue >= PRECACHE_LEN) {
+			SDL_Delay(1);
+		}*/
 
 		if (packet->stream_index == videoStream) {
 			//printf("video %d, %d frames queued\n", packet->pts, videoQueue->len);
@@ -563,12 +636,13 @@ int main(int argc, char** argv) {
 			//printf("audio %d\n", packet->pts);
 			frameQueue_enqueue(audioQueue, packet);
 		}
-		printf("video %d audio %d\n", videoQueue->len, audioQueue->len);
+		//printf("video %d audio %d\n", videoQueue->len, audioQueue->len);
 
 		
 		av_packet_unref(packet);
 	}
 
+	/*
 	SDL_Thread *videoDecoderThread = SDL_CreateThread(videoThread, "video", videoThreadData);
 	SDL_Thread *audioDecoderThread = SDL_CreateThread(audioThread, "audio", audioThreadData);
 
@@ -576,11 +650,12 @@ int main(int argc, char** argv) {
 	SDL_SemWait(videoThreadData->readySemaphore);
 	SDL_SemWait(audioThreadData->readySemaphore);
 
-	//if (!hasStarted && (videoQueue->len >= PRECACHE_LEN && audioQueue >= PRECACHE_LEN)) {
+	if (!hasStarted && (videoQueue->len >= PRECACHE_LEN && audioQueue >= PRECACHE_LEN)) {
 		hasStarted = 1;
 		SDL_SemPost(videoThreadData->playbackSemaphore);
 		SDL_SemPost(audioThreadData->playbackSemaphore);
-	//}
+	}
+	*/
 
 	videoThreadData->streaming = 0;
 	audioThreadData->streaming = 0;
